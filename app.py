@@ -16,6 +16,8 @@ with st.expander("ℹ️ About the Optimization Problem & Architecture", expande
     ### Problem Overview
     In sequential decision-making (like Direct Look-Ahead models, MPC, or Rolling Horizon dispatch), decisions are solved sequentially over time. At each step $t$, the system receives updated state information (e.g., current battery State of Charge $SOC_t$ or updated market prices).
     
+    While dynamic programming suffers from the "Curse of Dimensionality," applied sequential optimization faces the **Curse of Model Build Time**. Before a solver can optimize, Algebraic Modeling Languages (AMLs) like Pyomo or JuMP must translate the algebraic equations into a flat, numerical matrix. For massive sequential problems, this matrix generation step often takes longer than the optimization itself.
+
     This benchmark models a **Battery Storage Arbitrage** problem where the system charges during low prices and discharges during high prices to maximize profit.
 
     ### Mathematical Formulation
@@ -25,11 +27,41 @@ with st.expander("ℹ️ About the Optimization Problem & Architecture", expande
     $$
 
     - **Constraint Matrix ($A$)**: Encodes physical dynamics like battery efficiency ($\eta_c, \eta_d$) and storage energy balance. Matrix $A$ is **structurally invariant** over time.
-    - **RHS Vector ($b$)**: Encodes initial state boundary conditions ($SOC_0 = SOC_t$). Modifying $b$ shifts the feasible region hyperplanes without changing their normal vectors (slopes).
+    - **RHS Vector ($b$)**: Encodes initial state boundary conditions ($SOC_0 = SOC_t$), updated forecasts, or reserve requirements. Modifying $b$ shifts the feasible region hyperplanes without changing their normal vectors (slopes).
 
     ### The Performance Dilemma
-    1. **Naive Rebuild Approach (Anti-Pattern)**: Re-allocates variable objects, constraint expressions, and constraint matrices from scratch at every step. This incurs a massive **"Object Tax"** (memory reallocation overhead) and forces solvers into **Cold Starts**.
-    2. **Persistent Model RHS Update (Best Practice)**: Instantiates the optimization model structure and matrix exactly once outside the loop. At each time step, targeted functions mutate the Right-Hand Side (RHS) pointers in-place. This completely bypasses object creation and leverages **HiGHS Basis Warm Starts**. Because the constraint matrix $A$ is untouched, the solver reuses the optimal basis matrix $B^{-1}$ from the previous step, reducing the subsequent solves to just a few dual simplex pivots!
+    1. **Naive Rebuild Approach (Anti-Pattern)**: Re-allocates variable objects, constraint expressions, and constraint matrices from scratch at every step. This triggers massive **Symbolic Overhead** and garbage collection pauses as the AML builds out millions of object nodes, mapping them to the solver's C-level API over and over. You pay the matrix generation penalty repeatedly and force the solver into a **Cold Start**.
+    2. **Persistent Model RHS Update (Best Practice)**: The constraint matrix $A$ and variable bounds are compiled and loaded into the solver's memory exactly once outside the loop. At each time step, targeted functions mutate the Right-Hand Side (RHS) pointers in-place using low-level API hooks, bypassing AML object creation entirely. 
+    3. **Solver Warm-Starting**: Because the matrix $A$ is untouched, solvers (like HiGHS or Gurobi) reuse the optimal basis matrix $B^{-1}$ or interior-point state from the previous step. This reduces subsequent solves to just a few dual simplex pivots, trading a massive memory bottleneck for streamlined solve times!
+    """)
+
+with st.expander("ℹ️ The Battery Optimization Problem", expanded=False):
+    st.markdown(r"""
+    The problem evaluates a daily operation of a grid-scale battery storage system facing wholesale electricity market prices.
+
+    **Objective Function:**
+    Maximize the profit from energy arbitrage over the horizon $T$:
+    $$
+    \max \sum_{t=1}^T \lambda_t \cdot (p_t^{discharge} - p_t^{charge})
+    $$
+    where $\lambda_t$ is the market price at time $t$, and $p_t$ represents the power discharged/charged.
+
+    **Constraints:**
+    1. **State of Charge (SOC) Update:**
+       $$ SOC_{t} = SOC_{t-1} + \eta_c p_t^{charge} - \frac{1}{\eta_d} p_t^{discharge} \quad \forall t \in \{1, \dots, T\} $$
+    2. **Energy Limits:**
+       $$ SOC_{min} \le SOC_t \le SOC_{max} \quad \forall t \in \{1, \dots, T\} $$
+    3. **Power Limits:**
+       $$ 0 \le p_t^{charge} \le P_{max}^{charge} \quad \forall t \in \{1, \dots, T\} $$
+       $$ 0 \le p_t^{discharge} \le P_{max}^{discharge} \quad \forall t \in \{1, \dots, T\} $$
+
+    **Sequential Update & Future Uncertainty:**
+    In a real-world rolling horizon dispatch, the future prices $\lambda_t$ are uncertain and updated periodically based on new forecasts. 
+    1. At hour $h$, we solve the optimization problem for the next $T$ hours (the look-ahead horizon) using the latest price forecast and the *current* physical battery $SOC_0$.
+    2. We implement the dispatch decision for only the first step ($h$).
+    3. The horizon rolls forward to $h+1$. The $SOC_0$ is updated to reflect the physical state, new price forecasts $\lambda_t$ are received, and the optimization problem is solved again.
+    
+    This sequential updating means the mathematical model structure (the matrix) remains constant, but the initial state and parameters (the RHS vector and objective coefficients) change at every step.
     """)
 
 st.sidebar.header("Simulation Parameters")
